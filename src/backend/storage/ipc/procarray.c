@@ -46,6 +46,8 @@
 #include <signal.h>
 
 #include "access/clog.h"
+#include "access/csn_log.h"
+#include "access/csn_snapshot.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -94,6 +96,8 @@ typedef struct ProcArrayStruct
 	TransactionId replication_slot_xmin;
 	/* oldest catalog xmin of any replication slot */
 	TransactionId replication_slot_catalog_xmin;
+	/* xmin of oldest active csn snapshot */
+	TransactionId csn_snapshot_xmin;
 
 	/* indexes into allPgXact[], has PROCARRAY_MAXPROCS entries */
 	int			pgprocnos[FLEXIBLE_ARRAY_MEMBER];
@@ -249,6 +253,7 @@ CreateSharedProcArray(void)
 		procArray->lastOverflowedXid = InvalidTransactionId;
 		procArray->replication_slot_xmin = InvalidTransactionId;
 		procArray->replication_slot_catalog_xmin = InvalidTransactionId;
+		procArray->csn_snapshot_xmin = InvalidTransactionId;
 	}
 
 	allProcs = ProcGlobal->allProcs;
@@ -352,6 +357,14 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 		if (TransactionIdPrecedes(ShmemVariableCache->latestCompletedXid,
 								  latestXid))
 			ShmemVariableCache->latestCompletedXid = latestXid;
+
+		/*
+		 * Assign xid csn while holding ProcArrayLock for
+		 * COMMIT PREPARED. After lock is released consequent
+		 * CSNSnapshotCommit() will write this value to CsnLog.
+		 */
+		if (XidCSNIsInDoubt(pg_atomic_read_u64(&proc->assignedXidCsn)))
+			pg_atomic_write_u64(&proc->assignedXidCsn, GenerateCSN(false));
 	}
 	else
 	{
@@ -432,6 +445,8 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 
 		proc->lxid = InvalidLocalTransactionId;
 		pgxact->xmin = InvalidTransactionId;
+		proc->originalXmin = InvalidTransactionId;
+
 		/* must be cleared with xid/xmin: */
 		pgxact->vacuumFlags &= ~PROC_VACUUM_STATE_MASK;
 		proc->delayChkpt = false;	/* be sure this is cleared in abort */
@@ -454,6 +469,8 @@ ProcArrayEndTransactionInternal(PGPROC *proc, PGXACT *pgxact,
 	pgxact->xid = InvalidTransactionId;
 	proc->lxid = InvalidLocalTransactionId;
 	pgxact->xmin = InvalidTransactionId;
+	proc->originalXmin = InvalidTransactionId;
+
 	/* must be cleared with xid/xmin: */
 	pgxact->vacuumFlags &= ~PROC_VACUUM_STATE_MASK;
 	proc->delayChkpt = false;	/* be sure this is cleared in abort */
@@ -467,6 +484,16 @@ ProcArrayEndTransactionInternal(PGPROC *proc, PGXACT *pgxact,
 	if (TransactionIdPrecedes(ShmemVariableCache->latestCompletedXid,
 							  latestXid))
 		ShmemVariableCache->latestCompletedXid = latestXid;
+
+	/*
+	 * Assign xid csn while holding ProcArrayLock for
+	 * COMMIT.
+	 *
+	 * TODO: in case of group commit we can generate one CSNSnapshot for
+	 * whole group to save time on timestamp aquisition.
+	 */
+	if (XidCSNIsInDoubt(pg_atomic_read_u64(&proc->assignedXidCsn)))
+		pg_atomic_write_u64(&proc->assignedXidCsn, GenerateCSN(false));
 }
 
 /*
@@ -610,6 +637,7 @@ ProcArrayClearTransaction(PGPROC *proc)
 	pgxact->xid = InvalidTransactionId;
 	proc->lxid = InvalidLocalTransactionId;
 	pgxact->xmin = InvalidTransactionId;
+	proc->originalXmin = InvalidTransactionId;
 	proc->recoveryConflictPending = false;
 
 	/* redundant, but just in case */
@@ -833,6 +861,7 @@ ProcArrayApplyRecoveryInfo(RunningTransactions running)
 	while (TransactionIdPrecedes(latestObservedXid, running->nextXid))
 	{
 		ExtendSUBTRANS(latestObservedXid);
+		ExtendCSNLog(latestObservedXid);
 		TransactionIdAdvance(latestObservedXid);
 	}
 	TransactionIdRetreat(latestObservedXid);	/* = running->nextXid - 1 */
@@ -1311,6 +1340,7 @@ GetOldestXmin(Relation rel, int flags)
 
 	TransactionId replication_slot_xmin = InvalidTransactionId;
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
+	TransactionId csn_snapshot_xmin = InvalidTransactionId;
 
 	/*
 	 * If we're not computing a relation specific limit, or if a shared
@@ -1349,6 +1379,7 @@ GetOldestXmin(Relation rel, int flags)
 		{
 			/* Fetch xid just once - see GetNewTransactionId */
 			TransactionId xid = UINT32_ACCESS_ONCE(pgxact->xid);
+			TransactionId original_xmin = UINT32_ACCESS_ONCE(proc->originalXmin);
 
 			/* First consider the transaction's own Xid, if any */
 			if (TransactionIdIsNormal(xid) &&
@@ -1361,8 +1392,17 @@ GetOldestXmin(Relation rel, int flags)
 			 * We must check both Xid and Xmin because a transaction might
 			 * have an Xmin but not (yet) an Xid; conversely, if it has an
 			 * Xid, that could determine some not-yet-set Xmin.
+			 *
+			 * In case of oldestXmin calculation for CSNSnapshotMapXmin()
+			 * pgxact->xmin should be changed to proc->originalXmin. Details
+			 * in commets to CSNSnapshotMapXmin.
 			 */
-			xid = UINT32_ACCESS_ONCE(pgxact->xmin);
+			if ((flags & PROCARRAY_NON_IMPORTED_XMIN) &&
+					TransactionIdIsValid(original_xmin))
+				xid = original_xmin;
+			else
+				xid = UINT32_ACCESS_ONCE(pgxact->xmin);
+
 			if (TransactionIdIsNormal(xid) &&
 				TransactionIdPrecedes(xid, result))
 				result = xid;
@@ -1376,6 +1416,7 @@ GetOldestXmin(Relation rel, int flags)
 	 */
 	replication_slot_xmin = procArray->replication_slot_xmin;
 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
+	csn_snapshot_xmin = procArray->csn_snapshot_xmin;
 
 	if (RecoveryInProgress())
 	{
@@ -1416,6 +1457,11 @@ GetOldestXmin(Relation rel, int flags)
 		if (!TransactionIdIsNormal(result))
 			result = FirstNormalTransactionId;
 	}
+
+	if (!(flags & PROCARRAY_NON_IMPORTED_XMIN) &&
+		TransactionIdIsValid(csn_snapshot_xmin) &&
+		NormalTransactionIdPrecedes(csn_snapshot_xmin, result))
+		result = csn_snapshot_xmin;
 
 	/*
 	 * Check whether there are replication slots requiring an older xmin.
@@ -1511,8 +1557,10 @@ GetSnapshotData(Snapshot snapshot)
 	int			count = 0;
 	int			subcount = 0;
 	bool		suboverflowed = false;
+	XidCSN	xid_csn = FrozenXidCSN;
 	TransactionId replication_slot_xmin = InvalidTransactionId;
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
+	TransactionId csn_snapshot_xmin = InvalidTransactionId;
 
 	Assert(snapshot != NULL);
 
@@ -1704,9 +1752,17 @@ GetSnapshotData(Snapshot snapshot)
 	 */
 	replication_slot_xmin = procArray->replication_slot_xmin;
 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
+	csn_snapshot_xmin = procArray->csn_snapshot_xmin;
 
 	if (!TransactionIdIsValid(MyPgXact->xmin))
 		MyPgXact->xmin = TransactionXmin = xmin;
+
+	/*
+	 * Take XidCSN under ProcArrayLock so the snapshot stays
+	 * synchronized.
+	 */
+	if (!snapshot->takenDuringRecovery && get_csnlog_status())
+		xid_csn = GenerateCSN(false);
 
 	LWLockRelease(ProcArrayLock);
 
@@ -1722,6 +1778,10 @@ GetSnapshotData(Snapshot snapshot)
 	RecentGlobalXmin = globalxmin - vacuum_defer_cleanup_age;
 	if (!TransactionIdIsNormal(RecentGlobalXmin))
 		RecentGlobalXmin = FirstNormalTransactionId;
+
+	if (TransactionIdIsValid(csn_snapshot_xmin) &&
+		TransactionIdPrecedes(csn_snapshot_xmin, RecentGlobalXmin))
+		RecentGlobalXmin = csn_snapshot_xmin;
 
 	/* Check whether there's a replication slot requiring an older xmin. */
 	if (TransactionIdIsValid(replication_slot_xmin) &&
@@ -1777,6 +1837,11 @@ GetSnapshotData(Snapshot snapshot)
 		snapshot->whenTaken = GetSnapshotCurrentTimestamp();
 		MaintainOldSnapshotTimeMapping(snapshot->whenTaken, xmin);
 	}
+
+	snapshot->imported_snapshot_csn = false;
+	snapshot->snapshot_csn = xid_csn;
+	if (csn_snapshot_defer_time > 0 && IsUnderPostmaster)
+		CSNSnapshotMapXmin(snapshot->snapshot_csn);
 
 	return snapshot;
 }
@@ -3125,6 +3190,24 @@ ProcArrayGetReplicationSlotXmin(TransactionId *xmin,
 	LWLockRelease(ProcArrayLock);
 }
 
+/*
+ * ProcArraySetCSNSnapshotXmin
+ */
+void
+ProcArraySetCSNSnapshotXmin(TransactionId xmin)
+{
+	/* We rely on atomic fetch/store of xid */
+	procArray->csn_snapshot_xmin = xmin;
+}
+
+/*
+ * ProcArrayGetCSNSnapshotXmin
+ */
+TransactionId
+ProcArrayGetCSNSnapshotXmin(void)
+{
+	return procArray->csn_snapshot_xmin;
+}
 
 #define XidCacheRemove(i) \
 	do { \
@@ -3335,6 +3418,7 @@ RecordKnownAssignedTransactionIds(TransactionId xid)
 		while (TransactionIdPrecedes(next_expected_xid, xid))
 		{
 			TransactionIdAdvance(next_expected_xid);
+			ExtendCSNLog(next_expected_xid);
 			ExtendSUBTRANS(next_expected_xid);
 		}
 		Assert(next_expected_xid == xid);

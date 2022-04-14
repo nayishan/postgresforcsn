@@ -28,6 +28,7 @@
 
 #include "access/commit_ts.h"
 #include "access/gin.h"
+#include "access/csn_snapshot.h"
 #include "access/rmgr.h"
 #include "access/tableam.h"
 #include "access/transam.h"
@@ -1150,6 +1151,15 @@ static struct config_bool ConfigureNamesBool[] =
 			NULL
 		},
 		&track_commit_timestamp,
+		false,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_csn_snapshot", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Enable csn-base snapshot."),
+			gettext_noop("Used to achieve REPEATEBLE READ isolation level for postgres_fdw transactions.")
+		},
+		&enable_csn_snapshot,
 		false,
 		NULL, NULL, NULL
 	},

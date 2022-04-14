@@ -24,6 +24,7 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/csn_log.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
@@ -78,6 +79,7 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "access/csn_log.h"
 
 extern uint32 bootstrap_data_checksum_version;
 
@@ -4605,7 +4607,9 @@ InitControlFile(uint64 sysidentifier)
 	ControlFile->wal_level = wal_level;
 	ControlFile->wal_log_hints = wal_log_hints;
 	ControlFile->track_commit_timestamp = track_commit_timestamp;
+	ControlFile->enable_csn_snapshot = enable_csn_snapshot;
 	ControlFile->data_checksum_version = bootstrap_data_checksum_version;
+	ControlFile->xmin_for_csn = InvalidTransactionId;
 }
 
 static void
@@ -5344,6 +5348,7 @@ BootStrapXLOG(void)
 
 	/* Bootstrap the commit log, too */
 	BootStrapCLOG();
+	BootStrapCSNLog();
 	BootStrapCommitTs();
 	BootStrapSUBTRANS();
 	BootStrapMultiXact();
@@ -6801,6 +6806,9 @@ StartupXLOG(void)
 	if (ControlFile->track_commit_timestamp)
 		StartupCommitTs();
 
+	if(ControlFile->enable_csn_snapshot)
+		StartupCSN();
+
 	/*
 	 * Recover knowledge about replay progress of known replication partners.
 	 */
@@ -7062,6 +7070,7 @@ StartupXLOG(void)
 			 */
 			StartupCLOG();
 			StartupSUBTRANS(oldestActiveXID);
+			CSNSnapshotStartup(oldestActiveXID);
 
 			/*
 			 * If we're beginning at a shutdown checkpoint, we know that
@@ -7879,6 +7888,7 @@ StartupXLOG(void)
 	{
 		StartupCLOG();
 		StartupSUBTRANS(oldestActiveXID);
+		CSNSnapshotStartup(oldestActiveXID);
 	}
 
 	/*
@@ -7917,6 +7927,7 @@ StartupXLOG(void)
 	 * commit timestamp.
 	 */
 	CompleteCommitTsInitialization();
+	CompleteCSNInitialization();
 
 	/*
 	 * All done with end-of-recovery actions.
@@ -8525,6 +8536,7 @@ ShutdownXLOG(int code, Datum arg)
 		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
 	}
 	ShutdownCLOG();
+	ShutdownCSNLog();
 	ShutdownCommitTs();
 	ShutdownSUBTRANS();
 	ShutdownMultiXact();
@@ -9097,7 +9109,9 @@ CreateCheckPoint(int flags)
 	 * StartupSUBTRANS hasn't been called yet.
 	 */
 	if (!RecoveryInProgress())
+	{
 		TruncateSUBTRANS(GetOldestXmin(NULL, PROCARRAY_FLAGS_DEFAULT));
+	}
 
 	/* Real work is done, but log and update stats before releasing lock. */
 	LogCheckpointEnd(false);
@@ -9173,6 +9187,7 @@ static void
 CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 {
 	CheckPointCLOG();
+	CheckPointCSNLog();
 	CheckPointCommitTs();
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
@@ -9457,7 +9472,10 @@ CreateRestartPoint(int flags)
 	 * this because StartupSUBTRANS hasn't been called yet.
 	 */
 	if (EnableHotStandby)
+	{
 		TruncateSUBTRANS(GetOldestXmin(NULL, PROCARRAY_FLAGS_DEFAULT));
+		TruncateCSNLog(GetOldestXmin(NULL, PROCARRAY_FLAGS_DEFAULT));
+	}
 
 	/* Real work is done, but log and update before releasing lock. */
 	LogCheckpointEnd(true);
@@ -9712,6 +9730,9 @@ XLogRestorePoint(const char *rpName)
 static void
 XLogReportParameters(void)
 {
+	TransactionId	xmin_for_csn = InvalidTransactionId;
+
+	xmin_for_csn = ControlFile->xmin_for_csn;
 	if (wal_level != ControlFile->wal_level ||
 		wal_log_hints != ControlFile->wal_log_hints ||
 		MaxConnections != ControlFile->MaxConnections ||
@@ -9719,7 +9740,8 @@ XLogReportParameters(void)
 		max_wal_senders != ControlFile->max_wal_senders ||
 		max_prepared_xacts != ControlFile->max_prepared_xacts ||
 		max_locks_per_xact != ControlFile->max_locks_per_xact ||
-		track_commit_timestamp != ControlFile->track_commit_timestamp)
+		track_commit_timestamp != ControlFile->track_commit_timestamp ||
+		enable_csn_snapshot != ControlFile->enable_csn_snapshot)
 	{
 		/*
 		 * The change in number of backend slots doesn't need to be WAL-logged
@@ -9741,6 +9763,7 @@ XLogReportParameters(void)
 			xlrec.wal_level = wal_level;
 			xlrec.wal_log_hints = wal_log_hints;
 			xlrec.track_commit_timestamp = track_commit_timestamp;
+			xlrec.enable_csn_snapshot = enable_csn_snapshot;
 
 			XLogBeginInsert();
 			XLogRegisterData((char *) &xlrec, sizeof(xlrec));
@@ -9749,8 +9772,12 @@ XLogReportParameters(void)
 			XLogFlush(recptr);
 		}
 
+		prepare_csn_env(enable_csn_snapshot,
+				enable_csn_snapshot == ControlFile->enable_csn_snapshot,
+				&xmin_for_csn);
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 
+		ControlFile->xmin_for_csn = xmin_for_csn;
 		ControlFile->MaxConnections = MaxConnections;
 		ControlFile->max_worker_processes = max_worker_processes;
 		ControlFile->max_wal_senders = max_wal_senders;
@@ -9759,9 +9786,20 @@ XLogReportParameters(void)
 		ControlFile->wal_level = wal_level;
 		ControlFile->wal_log_hints = wal_log_hints;
 		ControlFile->track_commit_timestamp = track_commit_timestamp;
+		ControlFile->enable_csn_snapshot = enable_csn_snapshot;
 		UpdateControlFile();
 
 		LWLockRelease(ControlFileLock);
+	}
+	else
+	{
+		/*
+		 * When no GUC change, but for xmin_for_csn it should transmit the xmin_for_csn
+		 * from pg_control to csnState->xmin_for_csn. Or it will cause issue when prepare
+		 * transaction exixts and with 'xid-snapshot start  ->  csn-snapshot start  ->
+		 * csn-snapshot start' sequence.
+		 */
+		prepare_csn_env(enable_csn_snapshot, true, &xmin_for_csn);
 	}
 }
 
@@ -10191,6 +10229,9 @@ xlog_redo(XLogReaderState *record)
 		CommitTsParameterChange(xlrec.track_commit_timestamp,
 								ControlFile->track_commit_timestamp);
 		ControlFile->track_commit_timestamp = xlrec.track_commit_timestamp;
+		CSNlogParameterChange(xlrec.enable_csn_snapshot,
+								ControlFile->enable_csn_snapshot);
+		ControlFile->enable_csn_snapshot = xlrec.enable_csn_snapshot;
 
 		UpdateControlFile();
 		LWLockRelease(ControlFileLock);

@@ -181,6 +181,13 @@ typedef struct ControlFileData
 	int			max_prepared_xacts;
 	int			max_locks_per_xact;
 	bool		track_commit_timestamp;
+	bool		enable_csn_snapshot;
+
+	/*
+	 * Used to record a xmin when database startup with a snapshot-switch to csn snapshot,
+	 * and will hold the value until it switch to xid-snapshot.
+	 */
+	TransactionId xmin_for_csn;
 
 	/*
 	 * This data is used to check for hardware-architecture compatibility of
